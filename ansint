@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+import os
+import sys
+import errno
+import argparse
+
+__author__ = "Paweł Michalski"
+__version__ = "1.0"
+
+# Helper functions
+
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+def file_structure(path, structure):
+    mkdir_p(path)
+
+    for p in structure:
+        if p.endswith('/'):
+            mkdir_p(os.path.join(path, p))
+        else:
+            abspath = os.path.join(path, p) 
+            dirname = os.path.dirname(abspath)
+            mkdir_p(dirname)
+            open(abspath, 'a').close()
+
+def create_role_tree(path, name):
+    base_path = os.path.join(path, name)
+    structure = [
+        'files/',
+        'templates/',
+        'tasks/main.yml',
+        'handlers/main.yml',
+        'vars/main.yml',
+        'defaults/main.yml',
+        'main/main.yml'
+    ]
+
+    file_structure(base_path, structure)
+
+
+def fatal(msg, retval=1):
+    sys.stderr.write("%s\n" % msg)
+    sys.exit(retval)
+
+# Aggreataion object, used for storing arguments for ``agrpars.ArgumentParser.add_argument``
+class Option(object):
+    def __init__(self, *args, **nargs):
+        self.args = args
+        self.nargs = nargs
+
+# MetaClass providing autoregistering subparsers
+class MetaAction(type):
+    class_registry = []
+
+    def __new__(meta, name, bases, class_dict):
+        cls = type.__new__(meta, name, bases, class_dict)
+
+        # Do not register abstract classes
+        if '_%s__abstract' % cls.__name__ not in cls.__dict__:
+            MetaAction.class_registry.append(cls)
+        return cls
+
+    @classmethod
+    def register_action(self, *args, **kwargs): 
+        for c in MetaAction.class_registry:
+            c(*args, **kwargs)
+
+# Parent, abstract class for subparsers
+class Action(object):
+    options = []
+    __metaclass__ = MetaAction 
+
+    # Class fields starting with __ are private and they are no inherit
+    __abstract = True
+
+    def __init__(self, subparser):
+        self.local_parser = subparser.add_parser(self.action_name, help=self.help_msg)
+        self.local_parser.set_defaults(func=self)
+        if self.options:
+            self.register_options()
+
+    def register_options(self):
+        for opt in self.options:
+            self.local_parser.add_argument(*opt.args, **opt.nargs)
+
+    def __call__(self, args):
+        raise RuntimeError("Not implemented")
+
+# Subparsers classes
+
+class InitWorkspace(Action):
+    action_name = "init" 
+    help_msg = "creates basic workspace" 
+    options = [
+        Option('name', nargs='?', action="store", help="base name"),
+    ]
+
+    def __call__(self, args):
+        base_path = args.name if args.name else '.'
+        base_path = os.path.abspath(base_path)
+        mkdir_p(base_path)
+        files = [
+            'inventory',
+            'group_vars/',
+            'host_vars/',
+            'roles/'
+        ]
+        file_structure(base_path, files)
+        create_role_tree(os.path.join(base_path, 'roles'), 'common')
+
+class CreateRole(Action):
+    action_name = "role" 
+    help_msg = "creates role" 
+    options = [
+        Option('name', nargs='?', action="store", help="base name"),
+    ]
+
+    def __call__(self, args):
+        pass
+
+class CreateHost(Action):
+    action_name = "host" 
+    help_msg = "creates host" 
+    options = [
+        Option('-n', dest='name', action='store', required=True),
+        Option('-i', dest='ip', action='store', required=True),
+    ]
+
+    def __call__(self, args):
+        pass
+
+def run():
+    prog = os.path.basename(sys.argv[0])
+    parser = argparse.ArgumentParser(prog=prog, description='Ansible workspace helper')
+
+    parser.add_argument('-V', '--version', action='version', version="%s %s" % (prog, __version__))
+    action_parser = parser.add_subparsers()
+
+    MetaAction.register_action(action_parser)
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    run()
+
+
