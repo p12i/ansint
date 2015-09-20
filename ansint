@@ -2,11 +2,14 @@
 # coding=utf-8
 
 import os
+import re
 import sys
 import errno
 import argparse
+import tempfile
+import ansible.inventory
 
-__author__ = "Paweł Michalski"
+__author__ = "Paweł Michalski<pawel@michalski.it>"
 __version__ = "1.0"
 
 # Helper functions
@@ -51,12 +54,140 @@ def fatal(msg, retval=1):
     sys.stderr.write("%s\n" % msg)
     sys.exit(retval)
 
+def add_hosts_to_group(hosts, group, inventory):
+    def new_group(ht, grp):
+        data = "[%s]\n" % grp
+        for h in ht:
+            data += "%s\n" % h
+        return data
+
+    I = ansible.inventory.Inventory(inventory)
+    grp_obj = I.get_group(group)
+    if not grp_obj:
+        with open(inventory, 'a') as fp:
+             fp.write(new_group(hosts, group))
+    elif hosts:
+        grp_hosts = [hst.name for hst in grp_obj.get_hosts()]
+        cleaned_hosts = []
+        for h in hosts:
+            if h not in grp_hosts:
+                cleaned_hosts.append(h)
+
+        prefix = '%s-' % os.path.basename(sys.argv[0])
+        with open(inventory) as fp:
+            done = False
+            tfile = tempfile.NamedTemporaryFile(dir="/tmp", prefix=prefix, delete=False)
+            for line in fp:
+                tfile.write(line)
+                if not done and line.startswith('[%s]' % group):
+                    for h in cleaned_hosts:
+                        tfile.write("%s\n" % h)
+                    done = True
+            # For `all` group, and group :children groups
+            if not done: 
+                tfile.write(new_group(cleaned_hosts, group))
+            tfile.close()
+        os.rename(tfile.name, inventory)
+
+
+def add_or_set_var_yaml(fname, var_dict):
+    def tokenize(stream):
+        tokens = []
+        new_var = re.compile('^[a-zA-Z]')
+        buf = ''
+        for line in stream:
+            if buf and new_var.match(line): 
+                tokens.append(buf)
+                buf = line
+            else:
+                buf += line
+        if buf:
+            tokens.append(buf)
+        for t in tokens:
+            popped = False
+            for k, v in var_dict.items():
+                if t.startswith('%s:' % k):
+                    yield '%s: %s\n' % (k,v) 
+                    var_dict.pop(k)
+                    popped = True
+                    break
+            if not popped:
+                yield t
+        for k,v in var_dict.items():
+            yield '%s: %s\n' % (k,v) 
+
+    if os.path.isfile(fname) or os.path.islink(fname):
+        prefix = '%s-' % os.path.basename(sys.argv[0])
+        with open(fname) as fp:
+            tfile = tempfile.NamedTemporaryFile(dir="/tmp", prefix=prefix, delete=False)
+            for token in tokenize(fp):
+                tfile.write(token)
+            tfile.close()
+        os.rename(tfile.name, fname)
+    else:
+        with open(fname, 'w') as fp:
+            for k,v in var_dict.items():
+                fp.write('%s: %s\n' % (k,v))
+
 # Aggreataion object, used for storing arguments for ``agrpars.ArgumentParser.add_argument``
 class Option(object):
     def __init__(self, *args, **nargs):
         self.args = args
         self.nargs = nargs
 
+
+# Ansible host helper
+class Host(object):
+    fields = ['name', 'ip', 'groups', 'user', 'port', 'python', 'key']
+
+    def __init__(self, **kwargs):
+        for f in Host.fields:
+            setattr(self, f, kwargs.get(f))
+        self.vars = kwargs.get('vars', {})
+        self.var_dict = {} 
+        self._prepare_var_dict()
+
+    def __repr__(self):
+        value = self.name
+        for k, v in self.get_var_dict().items():
+            value += ' %s=%s' % (k, v)
+
+        return value
+
+    def set_var(self, name, value):
+        self.var_dict[name] = value
+
+    def get_var_dict(self):
+        return self.var_dict
+
+    def _prepare_var_dict(self):
+        if self.ip:
+            self.var_dict['ansible_ssh_host'] = self.ip
+        if self.user:
+            self.var_dict['ansible_ssh_user'] = self.user 
+        if self.port:
+            self.var_dict['ansible_ssh_port'] = self.port
+        if self.python:
+            self.var_dict['ansible_python_interpreter'] = self.python
+        if self.key:
+            self.var_dict['ansible_ssh_private_key_file'] = self.key
+
+        for k,v in self.vars.items():
+            self.var_dict[k] = v
+
+    def save(self, inventory):
+        base_dir = os.path.dirname(inventory)
+        # If there is no group specified, self.groups will be None - Not Iterable
+        if self.groups:
+            for g in self.groups:
+                add_hosts_to_group([self.name], g, inventory)
+        else:
+            add_hosts_to_group([self.name], 'all', inventory)
+
+        host_vars_file = os.path.join(base_dir, 'host_vars', self.name)
+        add_or_set_var_yaml(host_vars_file, self.get_var_dict())
+
+ 
 # MetaClass providing autoregistering subparsers
 class MetaAction(type):
     class_registry = []
@@ -71,8 +202,11 @@ class MetaAction(type):
 
     @classmethod
     def register_action(self, *args, **kwargs): 
+        value = []
         for c in MetaAction.class_registry:
-            c(*args, **kwargs)
+            value.append(c(*args, **kwargs))
+
+        return value
 
 # Parent, abstract class for subparsers
 class Action(object):
@@ -92,6 +226,9 @@ class Action(object):
         for opt in self.options:
             self.local_parser.add_argument(*opt.args, **opt.nargs)
 
+    def resolve_action(self, action_name):
+        return getattr(self, action_name)
+
     def __call__(self, args):
         raise RuntimeError("Not implemented")
 
@@ -107,42 +244,142 @@ class InitWorkspace(Action):
     def __call__(self, args):
         base_path = args.name if args.name else '.'
         base_path = os.path.abspath(base_path)
-        mkdir_p(base_path)
         files = [
-            'inventory',
             'group_vars/',
             'host_vars/',
             'roles/'
         ]
+
+        files.append(args.inventory)
+
+        mkdir_p(base_path)
         file_structure(base_path, files)
         create_role_tree(os.path.join(base_path, 'roles'), 'common')
 
 class CreateRole(Action):
     action_name = "role" 
-    help_msg = "creates role" 
+    help_msg = "creates role under `roles` directory" 
     options = [
-        Option('name', nargs='?', action="store", help="base name"),
+        Option('name', action="store", help="base name"),
+        Option('-p', dest='path', default='roles', action="store", help="path to roles dir, default roles"),
     ]
 
     def __call__(self, args):
-        pass
+        base_path = os.path.abspath(args.path)
+        create_role_tree(base_path, args.name)
+
+class CreateGroup(Action):
+    action_name = "group" 
+    help_msg = "creates group or adds variables to group" 
+    options = [
+        Option('name', action="store", help="base name"),
+        Option('-n', dest="hosts", action="append", default=[], help="hosts, available one or many"),
+        Option('-e', dest='vars', action='append', default=[], help="additional vars in format name:value, only simple vars, not arrays or dicts"),
+
+        Option('-A', dest="add_variables", action="store_true", default=False, help="add variable to group"),
+        Option('-N', dest="add_hosts", action="store_true", default=False, help="add host to group"),
+    ]
+
+    def __call__(self, args):
+        I = ansible.inventory.Inventory(args.inventory)
+        grp = I.get_group(args.name)
+        if not (args.add_variables or args.add_hosts) and grp:
+            fatal("Group already exit and no option -A either -N specified")
+        else:
+            add_hosts_to_group(args.hosts, args.name, args.inventory)
+
+        if args.add_variables:
+            fname = os.path.join(os.path.dirname(args.inventory), 'group_vars', args.name)
+            var_dict = {} 
+            for arg in args.vars:
+                k, v = arg.split(":")
+                var_dict[k] = v
+            add_or_set_var_yaml(fname, var_dict)
 
 class CreateHost(Action):
     action_name = "host" 
-    help_msg = "creates host" 
+    help_msg = "creates host or adds variables to host" 
     options = [
-        Option('-n', dest='name', action='store', required=True),
-        Option('-i', dest='ip', action='store', required=True),
+        Option(dest='name', action='store', help="host name"),
+        Option('-i', dest='ip', action='store', default=None, help="host ip"),
+        Option('-g', dest='groups', action='append', default=[], help="host groups, many group available"),
+        Option('-u', dest='user', action='store', default=None, help="host login name"),
+        Option('-p', dest='port', action='store', type=int, default=None, help="host ssh port"),
+        Option('-P', dest='python', action='store', default=None, help="python interpreter path"),
+        Option('-k', dest='key', action='store', default=None, help="ssh private key path"),
+
+        Option('-e', dest='vars', action='append', default=[], help="additional vars in format name:value, only simple vars, not arrays or dicts"),
+        Option('-A', dest="add_variables", action="store_true", default=False, help="add variable to host"),
     ]
 
     def __call__(self, args):
-        pass
+        params = {}
+        extra_vars = {}
+        if not args.add_variables and args.ip:
+            fatal("When creating a new host ip is requierd")
+
+        for k in ['name', 'ip', 'groups', 'user', 'port', 'python', 'port', 'key']:
+            params[k] = getattr(args, k)
+        for e in args.vars:
+            key, value = e.split(":")
+            extra_vars[key] = value
+        I = ansible.inventory.Inventory(args.inventory)
+        h = Host(vars=extra_vars, **params)
+        if I.get_host(h.name) and not args.add_variables:
+            fatal("Host is already in inventory")
+        h.save(args.inventory)
+
+
+class List(Action):
+    action_name = "list" 
+    help_msg = "list various options" 
+    options = [
+        Option('set', action='store', choices=['hosts', 'groups', 'roles'], help="set to display"),
+        Option('filter', nargs='?', action='store', help="filter by host"),
+        Option('-d', dest="details", action="store_true", default=False, help="print details, default false"),
+    ]
+
+    def __call__(self, args):
+        self.resolve_action(args.set)(args)
+
+    def hosts(self, args):
+        I = ansible.inventory.Inventory(args.inventory)
+        if args.filter:
+            pattern = args.filter
+        else:
+            pattern = 'all'
+        hosts_list = I.get_hosts(pattern)
+        for host in hosts_list:
+            print "HOST: %s" % host.name
+            if args.details:
+                for k,v in host.get_variables().items():
+                    print '  %s: %s' % (k, v)
+
+    def groups(self, args):
+        I = ansible.inventory.Inventory(args.inventory)
+        if args.filter:
+            groups = I.groups_for_host(args.filter)
+        else:
+            groups = I.get_groups()
+        for g in groups:
+            print "GROUP: %s" % g.name
+            if args.details:
+                for h in g.get_hosts():
+                    print " %s" % h.name
+
+    def roles(self, args):
+        path = os.path.dirname(args.inventory)
+        roles_dir = os.path.join(path, 'roles')
+        for r in os.listdir(roles_dir):
+            print "ROLE: %s" % r
+
 
 def run():
     prog = os.path.basename(sys.argv[0])
     parser = argparse.ArgumentParser(prog=prog, description='Ansible workspace helper')
 
     parser.add_argument('-V', '--version', action='version', version="%s %s" % (prog, __version__))
+    parser.add_argument('-I', dest="inventory", action='store', default="inventory", help="Inventory file name, default inventory")
     action_parser = parser.add_subparsers()
 
     MetaAction.register_action(action_parser)
@@ -151,5 +388,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
-
