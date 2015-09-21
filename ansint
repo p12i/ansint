@@ -315,7 +315,7 @@ class CreateHost(Action):
     def __call__(self, args):
         params = {}
         extra_vars = {}
-        if not args.add_variables and args.ip:
+        if not args.add_variables and not args.ip:
             fatal("When creating a new host ip is requierd")
 
         for k in ['name', 'ip', 'groups', 'user', 'port', 'python', 'port', 'key']:
