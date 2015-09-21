@@ -5,7 +5,7 @@ Ansible inventory helper
 - creating basic skeleton of ansible workspace
 - creating basic skeleton of ansible roles
 - adding hosts to inventory
-- adding grops to inventory
+- adding groups to inventory
 - adding vairables to group and hosts
 - adding hosts to groups
 - listing hosts, groups and vars
